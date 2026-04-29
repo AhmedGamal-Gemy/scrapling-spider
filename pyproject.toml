@@ -13,7 +13,7 @@ dependencies = [
     "curl_cffi",
     "playwright",
     "patchright",
-    "patchright"
+    "msgspec"
 ]
 
 [tool.setuptools.packages.find]
