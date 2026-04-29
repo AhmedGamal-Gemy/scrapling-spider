@@ -12,6 +12,7 @@ dependencies = [
     "pydantic>=2.0",
     "curl_cffi",
     "playwright",
+    "patchright",
     "patchright"
 ]
 
