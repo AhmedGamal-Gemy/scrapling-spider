@@ -11,7 +11,8 @@ dependencies = [
     "scrapling",
     "pydantic>=2.0",
     "curl_cffi",
-    "playwright"
+    "playwright",
+    "patchright"
 ]
 
 [tool.setuptools.packages.find]
