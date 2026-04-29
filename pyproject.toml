@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scrapling-spider"
+version = "0.1.0"
+description = "Advanced Scrapling-based spider for reconnaissance purposes"
+requires-python = ">=3.10"
+dependencies = [
+    "scrapling",
+    "pydantic>=2.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["scrapling_spider*"]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
+demo = ["streamlit"]
