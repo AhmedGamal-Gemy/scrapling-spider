@@ -13,7 +13,8 @@ dependencies = [
     "curl_cffi",
     "playwright",
     "patchright",
-    "msgspec"
+    "msgspec",
+    "browserforge"
 ]
 
 [tool.setuptools.packages.find]
