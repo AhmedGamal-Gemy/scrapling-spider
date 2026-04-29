@@ -10,7 +10,8 @@ requires-python = ">=3.10"
 dependencies = [
     "scrapling",
     "pydantic>=2.0",
-    "curl_cffi"
+    "curl_cffi",
+    "playwright"
 ]
 
 [tool.setuptools.packages.find]
