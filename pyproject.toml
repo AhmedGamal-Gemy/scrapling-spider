@@ -14,7 +14,8 @@ dependencies = [
     "playwright",
     "patchright",
     "msgspec",
-    "browserforge"
+    "browserforge",
+    "protego"
 ]
 
 [tool.setuptools.packages.find]
