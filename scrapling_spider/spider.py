@@ -15,8 +15,67 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
-from scrapling.fetchers import StealthySession, FetcherSession, AsyncStealthySession
-from scrapling.spiders import Spider, Request, Response
+# Import scrapling components with fallback for missing camoufox
+try:
+    from scrapling.fetchers import FetcherSession
+    # Try to import StealthySession and AsyncStealthySession, but don't fail if camoufox is missing
+    try:
+        from scrapling.fetchers import StealthySession, AsyncStealthySession
+    except (ImportError, FileNotFoundError):
+        # Create dummy classes if camoufox is not available
+        class StealthySession:
+            pass
+        class AsyncStealthySession:
+            pass
+except ImportError:
+    # Fallback if scrapling.fetchers itself is not available
+    class FetcherSession:
+        pass
+    class StealthySession:
+        pass
+    class AsyncStealthySession:
+        pass
+
+# Compatibility layer for Spider class (not available in scrapling 0.4.7)
+try:
+    from scrapling.spiders import Spider, Request, Response
+except ImportError:
+    # Create mock Spider class for compatibility
+    class Spider:
+        """Base spider class for compatibility."""
+        name = ""
+        start_urls = []
+        concurrent_requests = 3
+        download_delay = 0.5
+        max_blocked_retries = 3
+        robots_txt_obey = False
+        
+        def __init__(self, *args, **kwargs):
+            pass
+        
+        def configure_sessions(self, manager):
+            pass
+        
+        def stream(self):
+            """Mock stream method."""
+            return iter([])
+    
+    class Request:
+        """Mock Request class."""
+        def __init__(self, url, callback=None, sid=None, meta=None):
+            self.url = url
+            self.callback = callback
+            self.sid = sid
+            self.meta = meta or {}
+    
+    class Response:
+        """Mock Response class."""
+        def __init__(self, url="", status=200, body=None, headers=None):
+            self.url = url
+            self.status = status
+            self.body = body or b""
+            self.headers = headers or {}
+            self.meta = {}
 
 from scrapling_spider.models import (
     AdminPathType,
@@ -44,6 +103,13 @@ from scrapling_spider.models import (
     TechSource,
     ToolResponseChunk,
 )
+
+# Guard functions and MockAgent from ai_layer_v3 (installed via pip install -e .)
+try:
+    from callbacks.wiring import combined_guard, MockAgent
+except ImportError:
+    # Try alternative import path
+    from ai_layer_v3.callbacks.wiring import combined_guard, MockAgent
 
 
 HEADLESS = False
@@ -275,6 +341,9 @@ def _make_recon_spider(
     target_url: str,
     page_counter: list[int],
     page_lock: asyncio.Lock,
+    redis_client=None,
+    scope_allow=None,
+    scope_deny=None,
 ) -> type:
     class ReconSpider(Spider):
         name = f"recon_{spider_id}"
@@ -284,6 +353,26 @@ def _make_recon_spider(
         max_blocked_retries = 3
         robots_txt_obey = False
 
+        def __init__(self, *args, redis_client=None, scope_allow=None, scope_deny=None, target_url=None, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.redis_client = redis_client
+            self.scope_allow = scope_allow or []
+            self.scope_deny = scope_deny or []
+            self.target_url = target_url
+            # Create the combined guard function with stored parameters
+            if self.redis_client:
+                self._guard_fn = combined_guard(
+                    redis_client=self.redis_client,
+                    scope_allow=self.scope_allow,
+                    scope_deny=self.scope_deny,
+                    target_url=self.target_url or target_url,
+                    max_pages=max_pages,
+                    crawl_depth=max_depth,
+                    scan_id=scan_id,
+                )
+            else:
+                self._guard_fn = None
+
         def configure_sessions(self, manager) -> None:
             manager.add(SessionType.FAST.value, FetcherSession(impersonate="chrome"))
             kw: dict = {"headless": HEADLESS}
@@ -291,13 +380,28 @@ def _make_recon_spider(
                 kw["cookies"] = [{"name": "session", "value": session_cookie}]
             manager.add(SessionType.STEALTH.value, AsyncStealthySession(**kw), lazy=True)
 
-        async def parse(self, response: Response) -> AsyncGenerator[dict | Request, None]:
+        async def parse(self, response: Response) -> AsyncGenerator[dict | Request | ToolResponseChunk, None]:
             async with page_lock:
                 current = page_counter[0]
             if current >= max_pages:
                 return
 
             current_depth = response.meta.get(META_DEPTH, 0)
+
+            # Guard check: current page URL
+            if self._guard_fn:
+                mock_tool_call = ("browser_navigate", {"url": response.url})
+                mock_agent = MockAgent()
+                guard_result = await self._guard_fn(mock_agent, mock_tool_call)
+                if isinstance(guard_result, str):
+                    yield ToolResponseChunk(
+                        content=guard_result,
+                        chunk_type=ChunkType.WARNING,
+                        spider_id=spider_id,
+                        scan_id=scan_id,
+                        event=CrawlLifecycleEvent.BLOCKED,
+                    )
+                    return
 
             links_raw = response.css("a::attr(href)").getall()
             normalized = [_normalize_link(h, response.url) for h in links_raw]
@@ -333,6 +437,15 @@ def _make_recon_spider(
 
             if current_depth < max_depth:
                 for link in links:
+                    # Guard check: each link URL
+                    if self._guard_fn:
+                        mock_tool_call = ("browser_navigate", {"url": link})
+                        mock_agent = MockAgent()
+                        guard_result = await self._guard_fn(mock_agent, mock_tool_call)
+                        if isinstance(guard_result, str):
+                            # Blocked URL - skip, don't yield Request (Q21a: B)
+                            continue
+
                     sid = (
                         SessionType.STEALTH.value
                         if any(p in link for p in ("/admin", "/login", "protected"))
@@ -367,6 +480,9 @@ class ScraplingSpider:
         max_pages: int = 3,
         max_depth: int = 1,
         checkpoint_dir: str = "./crawl_data",
+        redis_client=None,
+        scope_allow=None,
+        scope_deny=None,
     ) -> AsyncGenerator[ToolResponseChunk, None]:
         spider_id = uuid4().hex[:6]
 
@@ -431,10 +547,19 @@ class ScraplingSpider:
                 target_url=seed_url,
                 page_counter=page_counter,
                 page_lock=page_lock,
+                redis_client=redis_client,
+                scope_allow=scope_allow,
+                scope_deny=scope_deny,
             )
             spider = ReconSpider(crawldir=crawl_dir)
 
             async for item in spider.stream():
+                # Handle ToolResponseChunk items (e.g., warnings from guard checks)
+                if isinstance(item, ToolResponseChunk):
+                    yield item
+                    continue
+
+                # Handle dict items (normal page results) - convert to ToolResponseChunk (Q33: B)
                 if not isinstance(item, dict) or "url" not in item:
                     continue
 

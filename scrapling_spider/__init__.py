@@ -1,8 +1,33 @@
 from scrapling_spider.spider import (
     ScraplingSpider,
     scrapling_tool,
-    ScraplingSpider as ScraplingSpiderLongRunTool,
+    SpiderConcurrencyLimiter,
+    get_scrapling_spider_concurrency_limiter,
+    MAX_CONCURRENT_SPIDERS,
+    HEADLESS,
+    format_item,
+    format_final,
+    format_error,
+    format_lifecycle,
+    # Internal helpers
+    _normalize_link,
+    _normalize_tech_name,
+    _detect_content_type,
+    _detect_endpoint_type,
+    _detect_auth_hint,
+    _detect_admin_path,
+    _detect_subdomain,
+    _missing_security_headers,
+    _has_cors_wildcard,
+    _filter_relevant_headers,
+    _extract_tech,
+    _analyze_forms,
+    _auto_classify,
 )
+
+# Backward compatibility alias
+ScraplingSpiderLongRunTool = ScraplingSpider
+
 from scrapling_spider.models import (
     SpiderPageResult,
     SpiderFinalSummary,
@@ -52,4 +77,26 @@ __all__ = [
     "ContentTypeCategory",
     "SecurityIssue",
     "AgentInteractionMessages",
+    # Extras for tests
+    "SpiderConcurrencyLimiter",
+    "get_scrapling_spider_concurrency_limiter",
+    "MAX_CONCURRENT_SPIDERS",
+    "HEADLESS",
+    "format_item",
+    "format_final",
+    "format_error",
+    "format_lifecycle",
+    "_normalize_link",
+    "_normalize_tech_name",
+    "_detect_content_type",
+    "_detect_endpoint_type",
+    "_detect_auth_hint",
+    "_detect_admin_path",
+    "_detect_subdomain",
+    "_missing_security_headers",
+    "_has_cors_wildcard",
+    "_filter_relevant_headers",
+    "_extract_tech",
+    "_analyze_forms",
+    "_auto_classify",
 ]
