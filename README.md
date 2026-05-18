@@ -1,6 +1,6 @@
 # scrapling-spider
 
-Advanced Scrapling-based stealth spider for reconnaissance purposes.
+A stealth web crawler for structured data extraction and surface mapping — originally built as the reconnaissance engine for the Inspect AI pentesting framework.
 
 ## Description
 
