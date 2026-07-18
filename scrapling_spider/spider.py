@@ -118,6 +118,25 @@ MAX_LINKS_IN_CONTENT = 0
 MAX_TECH_IN_CONTENT = 3
 MAX_HEADERS_IN_CONTENT = 3
 
+# ── Injectable broadcast handler ─────────────────────────────────────────
+# The main app (ai_layer_v3) registers its WebSocket manager here so that
+# recon_spider() can stream progress without importing ai_layer_v3 directly.
+_broadcast_handler: Callable[[str, dict], Awaitable[None]] | None = None
+
+
+def register_broadcast_handler(
+    handler: Callable[[str, dict], Awaitable[None]] | None,
+) -> None:
+    """Set the async broadcast callable used by :func:`recon_spider`.
+
+    The handler receives ``(scan_id, message_dict)`` and is expected to
+    deliver the message to all WebSocket clients for that scan.
+
+    Pass ``None`` to un-register (broadcasts become no-ops).
+    """
+    global _broadcast_handler
+    _broadcast_handler = handler
+
 HEADER_PATTERNS: list[tuple[str, re.Pattern, TechSource]] = [
     (
         "server",
@@ -374,7 +393,7 @@ def _make_recon_spider(
                 self._guard_fn = None
 
         def configure_sessions(self, manager) -> None:
-            manager.add(SessionType.FAST.value, FetcherSession(impersonate="chrome"))
+            manager.add(SessionType.FAST.value, FetcherSession(impersonate=None))
             kw: dict = {"headless": HEADLESS}
             if session_cookie:
                 kw["cookies"] = [{"name": "session", "value": session_cookie}]
@@ -1043,3 +1062,210 @@ def format_lifecycle(event: CrawlLifecycleEvent, spider_id: str, scan_id: str) -
     return AgentInteractionMessages.SCRAPLING_LIFECYCLE.format(
         event=event.value, sid=spider_id, scan_id=scan_id
     )
+
+
+# =============================================================================
+# Public ADK-facing functions
+# =============================================================================
+
+
+async def recon_spider(
+    seed_url: str,
+    max_pages: int = 3,
+    max_depth: int = 1,
+    tool_context=None,
+) -> str:
+    """Crawl a target URL with stealth scraping.
+
+    Each page is broadcast to WebSocket clients in real-time as the crawl
+    progresses.  The final summary string is returned to the agent.
+
+    Args:
+        seed_url:  The URL to start crawling from.
+        max_pages: Maximum number of pages to crawl (default 3).
+        max_depth: Maximum crawl depth (default 1).
+        tool_context: ADK-injected tool context (provides session_id → scan_id).
+
+    Returns:
+        Human-readable summary string.
+    """
+    # Extract scan_id from ADK's tool context
+    scan_id = ""
+    if tool_context is not None:
+        session = getattr(tool_context, "session", None)
+        if session is not None:
+            scan_id = getattr(session, "id", "") or ""
+
+    async def _ws(payload: dict) -> None:
+        """Broadcast if we have a scan_id and a handler, else no-op."""
+        if scan_id and _broadcast_handler is not None:
+            await _broadcast_handler(scan_id, payload)
+
+    spider_id = uuid4().hex[:6]
+
+    if not seed_url.startswith(("http://", "https://")):
+        err = SpiderError(
+            error_type=ErrorType.INVALID_URL,
+            message=f"bad url: {seed_url}",
+            url=seed_url,
+            retryable=False,
+            suggested_action=AgentSuggestedAction.ABORT,
+        )
+        await _ws({"event": "spider_error", "error": format_error(err)})
+        return format_error(err)
+
+    crawl_dir = f"./crawl_data/recon_spider_{spider_id}_{scan_id}"
+    limiter = get_scrapling_spider_concurrency_limiter()
+    await limiter.acquire()
+
+    page_counter: list[int] = [0]
+    page_lock = asyncio.Lock()
+    start_time = time.monotonic()
+    stop_reason = CrawlStopReason.EXHAUSTED
+
+    totals: dict[str, int] = {
+        "links": 0, "forms": 0, "login": 0, "admin": 0,
+        "api": 0, "subdomain": 0, "cors": 0,
+    }
+    all_tech: set[str] = set()
+
+    try:
+        await _ws({
+            "event": "spider_lifecycle",
+            "type": CrawlLifecycleEvent.STARTED.value,
+            "spider_id": spider_id,
+            "scan_id": scan_id,
+        })
+
+        ReconSpider = _make_recon_spider(
+            seed_url=seed_url,
+            scan_id=scan_id,
+            spider_id=spider_id,
+            max_depth=max_depth,
+            max_pages=max_pages,
+            session_cookie=None,
+            target_url=seed_url,
+            page_counter=page_counter,
+            page_lock=page_lock,
+        )
+        spider = ReconSpider(crawldir=crawl_dir)
+
+        async for item in spider.stream():
+            if not isinstance(item, dict) or "url" not in item:
+                continue
+
+            try:
+                result = SpiderPageResult(**item)
+            except ValidationError as e:
+                err = SpiderError(
+                    error_type=ErrorType.VALIDATION,
+                    message=str(e),
+                    url=item.get("url", "unknown"),
+                    retryable=False,
+                    suggested_action=AgentSuggestedAction.SKIP,
+                )
+                await _ws({"event": "spider_error", "error": format_error(err)})
+                continue
+
+            async with page_lock:
+                page_counter[0] += 1
+                current_count = page_counter[0]
+
+            if current_count >= max_pages:
+                stop_reason = CrawlStopReason.MAX_PAGES
+                await _ws({
+                    "event": "spider_progress",
+                    "url": result.url,
+                    "page_count": current_count,
+                    "links": result.link_count,
+                    "forms": result.form_count,
+                    "observation_hint": None,
+                    "tech_hints": [],
+                })
+                break
+
+            obs_hint, ind_hint = _auto_classify(result)
+            result = result.model_copy(
+                update={
+                    "observation_hint": obs_hint,
+                    "indicator_type": ind_hint,
+                    "page_count": current_count,
+                }
+            )
+
+            totals["links"] += result.link_count
+            totals["forms"] += result.form_count
+            totals["cors"] += int(result.cors_wildcard)
+            totals["login"] += int(obs_hint == ObservationType.LOGIN_PAGE)
+            totals["admin"] += int(obs_hint == ObservationType.ADMIN_PANEL)
+            totals["api"] += int(obs_hint == ObservationType.EXPOSED_ENDPOINT)
+            totals["subdomain"] += int(result.is_subdomain)
+            for h in result.tech_hints:
+                all_tech.add(h.technology)
+
+            # Broadcast per-page progress to WebSocket clients
+            await _ws({
+                "event": "spider_progress",
+                "url": result.url,
+                "page_count": current_count,
+                "links": result.link_count,
+                "forms": result.form_count,
+                "observation_hint": obs_hint.value if obs_hint else None,
+                "tech_hints": [h.technology for h in result.tech_hints],
+            })
+
+        # Build final summary
+        summary = SpiderFinalSummary(
+            scan_id=scan_id,
+            spider_id=spider_id,
+            stop_reason=stop_reason,
+            total_pages=page_counter[0],
+            total_links=totals["links"],
+            total_forms=totals["forms"],
+            login_pages_found=totals["login"],
+            admin_panels_found=totals["admin"],
+            api_endpoints_found=totals["api"],
+            subdomains_found=totals["subdomain"],
+            cors_wildcard_count=totals["cors"],
+            tech_detected=sorted(all_tech),
+            security_issues=[],
+            duration_seconds=time.monotonic() - start_time,
+            checkpoint_dir=None,
+        )
+        final_msg = format_final(summary)
+        await _ws({"event": "spider_complete", "summary": final_msg})
+        return final_msg
+
+    except Exception as e:
+        err = SpiderError(
+            error_type=ErrorType.NETWORK,
+            message=str(e),
+            url=seed_url,
+            retryable=False,
+            suggested_action=AgentSuggestedAction.DEGRADE,
+        )
+        await _ws({"event": "spider_error", "error": format_error(err)})
+        return format_error(err)
+    finally:
+        limiter.release()
+        shutil.rmtree(crawl_dir, ignore_errors=True)
+
+
+def create_recon_spider_tool():
+    """Create an ADK ``FunctionTool`` wrapping the spider.
+
+    The tool broadcasts per-page progress directly via WebSocket.
+    ADK receives only the final summary string.
+
+    Usage::
+
+        from tools.scrapling_tool import create_recon_spider_tool
+
+        agent = LlmAgent(
+            model=...,
+            tools=[create_recon_spider_tool(), ...],
+        )
+    """
+    from google.adk.tools import FunctionTool
+
+    return FunctionTool(func=recon_spider)
